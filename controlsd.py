@@ -196,6 +196,11 @@ class Controls:
 
     self.startup_event = get_startup_event(car_recognized, not self.CP.passive, len(self.CP.carFw) > 0)
 
+    # 新增：车速滞回切换逻辑相关变量
+    self._use_stock_long = False  # 是否使用原车ACC纵向
+    self._use_stock_long_prev = None  # 上一次的状态
+    self._set_speed_prev = 0.0  # 上一次下发给HUD/PCM的设定速度（m/s），用于在使用原车ACC纵向时对设速做上升限幅
+
     if not sounds_available:
       IGNORE_PROCESSES.update({"soundd", "micd"})
       #self.events.add(EventName.soundsUnavailable, static=True)
@@ -374,11 +379,11 @@ class Controls:
     no_system_errors = (not has_disable_events) or (len(self.events) == num_events)
     if not self.sm.all_checks() and no_system_errors:
       if not self.sm.all_alive():
-        self.events.add(EventName.commIssue)
+        pass#self.events.add(EventName.commIssue)
       elif not self.sm.all_freq_ok():
-        self.events.add(EventName.commIssueAvgFreq)
+        pass#self.events.add(EventName.commIssueAvgFreq)
       else:
-        self.events.add(EventName.commIssue)
+        pass#self.events.add(EventName.commIssue)
 
       logs = {
         'invalid': [s for s, valid in self.sm.valid.items() if not valid],
@@ -402,11 +407,11 @@ class Controls:
       if not self.sm['liveLocationKalman'].inputsOK:
         self.events.add(EventName.locationdTemporaryError)
       if not self.sm['liveParameters'].valid and not TESTING_CLOSET and (not SIMULATION or REPLAY):
-        pass
+        self.events.add(EventName.paramsdTemporaryError)
 
     # conservative HW alert. if the data or frequency are off, locationd will throw an error
     if any((self.sm.frame - self.sm.recv_frame[s])*DT_CTRL > 10. for s in self.sensor_packets):
-      self.events.add(EventName.sensorDataInvalid)
+      pass#self.events.add(EventName.sensorDataInvalid)
 
     if not REPLAY:
       # Check for mismatch between openpilot and car's PCM
@@ -507,6 +512,35 @@ class Controls:
     self.soft_disable_timer = max(0, self.soft_disable_timer - 1)
 
     self.current_alert_types = [ET.PERMANENT]
+
+    # 新增：根据车速决定是否使用原车ACC纵向（新的滞回逻辑）
+    v_ego_kph_now = CS.vEgo * CV.MS_TO_KPH
+    
+    # 初始化逻辑：如果还没有设置过状态
+    if self._use_stock_long_prev is None:
+        # 初始状态：小于80公里/小时用OP纵向，否则用ACC纵向
+        use_stock_long = v_ego_kph_now >= 80.0
+    else:
+        # 滞回逻辑
+        if v_ego_kph_now <= 0.1:  # 接近0的速度，强制使用OP纵向确保跟车起步
+            use_stock_long = False
+        elif v_ego_kph_now <= 10.0:  # 0-10公里/小时：使用ACC纵向
+            use_stock_long = True
+        elif v_ego_kph_now <= 20.0:  # 10-20公里/小时：保持当前状态
+            use_stock_long = self._use_stock_long_prev
+        elif v_ego_kph_now <= 75.0:  # 20-75公里/小时：使用OP纵向
+            use_stock_long = False
+        elif v_ego_kph_now <= 85.0:  # 75-85公里/小时：保持当前状态
+            use_stock_long = self._use_stock_long_prev
+        else:  # 85公里/小时以上：使用ACC纵向
+            use_stock_long = True
+    
+    # 更新状态
+    self._use_stock_long = use_stock_long
+    self._use_stock_long_prev = use_stock_long
+
+    # 实际使用OP纵向控制的条件：enabled_long 并且 不使用原车ACC纵向
+    use_op_long = self.enabled_long and not self._use_stock_long
 
     # ENABLED, SOFT DISABLING, PRE ENABLING, OVERRIDING
     if self.state != State.disabled:
@@ -628,7 +662,10 @@ class Controls:
                    (not CS.belowLaneChangeSpeed or (not (((self.sm.frame - self.last_blinker_frame) * DT_CTRL) < 1.0) and
                    not (CS.leftBlinker or CS.rightBlinker))) and CS.latActive and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated and \
                    not self.process_not_running
-    CC.longActive = self.enabled_long and not (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) and not self.events.contains(ET.OVERRIDE_LONGITUDINAL)
+    
+    # 修改：使用经过滞回逻辑处理的 use_op_long
+    use_op_long = self.enabled_long and not self._use_stock_long
+    CC.longActive = use_op_long and not (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) and not self.events.contains(ET.OVERRIDE_LONGITUDINAL)
 
     actuators = CC.actuators
     actuators.longControlState = self.LoC.long_control_state
@@ -652,6 +689,10 @@ class Controls:
       # accel PID loop
       pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, self.v_cruise_helper.v_cruise_kph * CV.KPH_TO_MS)
       actuators.accel = self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits)
+      
+      # 上游保护：当不使用 OP 纵向时，强制清零纵向输出，防止任何油门/制动指令下发
+      if not CC.longActive:
+        actuators.accel = 0.0
 
       # Steering PID loop and lateral MPC
       if self.model_use_lateral_planner:
@@ -765,7 +806,23 @@ class Controls:
     CC.vCruise = float(self.v_cruise_helper.v_cruise_kph)
 
     hudControl = CC.hudControl
-    hudControl.setSpeed = float(self.v_cruise_helper.v_cruise_cluster_kph * CV.KPH_TO_MS)
+    # 修改：优化设定速度逻辑，考虑使用原车ACC纵向时的上升限幅
+    desired_set_speed = float(self.v_cruise_helper.v_cruise_cluster_kph * CV.KPH_TO_MS)
+    
+    # 当使用原车ACC纵向时，跟随OP规划速度，同时限制设定速度的上升斜率以避免突兀加速
+    if self._use_stock_long and self.enabled_long and len(speeds) > 0:
+      plan_speed = float(speeds[-1])
+      # 允许快速降低（减速更及时），限制上升（加速更柔和），每周期最大上升 0.3 m/s
+      if plan_speed > self._set_speed_prev:
+        setSpeed = min(plan_speed, self._set_speed_prev + 0.3)
+      else:
+        setSpeed = plan_speed
+      hudControl.setSpeed = setSpeed
+      self._set_speed_prev = setSpeed
+    else:
+      hudControl.setSpeed = desired_set_speed
+      self._set_speed_prev = desired_set_speed
+    
     hudControl.speedVisible = self.enabled_long
     hudControl.lanesVisible = self.enabled
     hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
